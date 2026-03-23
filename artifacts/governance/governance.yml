@@ -1,0 +1,270 @@
+#####################################################################
+#                                                                   #
+#   Version: V1.0.4                                                 #
+#   Author: Michael Coulling-Green                                  #
+#   PIPELINE_TYPE: governance-of-governance gate (Option A hardened)#
+#                                                                   #
+#   Purpose: Protect governance/owners.yml itself.                  #
+#   Rule: ONLY governance owners ALREADY listed on main may change  #
+#         governance/owners.yml                                     #
+#                                                                   #
+#   Behaviour:                                                      #
+#   - PR builds: governance owners are read from origin/main        #
+#   - main builds: governance owners are read from the working tree #
+#                                                                   #
+#####################################################################
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - governance/owners.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - governance/owners.yml
+
+pool:
+  name: Default
+  
+stages:
+- stage: GovernanceOwnersGate
+  displayName: "Governance-of-governance – owners.yml gate (Option A hardened)"
+  jobs:
+  - job: gate
+    displayName: "Enforce governance owners for owners.yml changes"
+    steps:
+    - checkout: self
+      fetchDepth: 0
+      persistCredentials: true
+
+    - task: AzureCLI@2
+      displayName: "Gate: only governance owners may change owners.yml"
+      inputs:
+        azureSubscription: "sc-terraform-lab"
+        scriptType: "ps"
+        scriptLocation: "inlineScript"
+        inlineScript: |
+          $ErrorActionPreference = "Stop"
+
+          $ownersFile = "governance/owners.yml"
+
+          # ADO actor identity
+          $actorEmail  = "$(Build.RequestedForEmail)".Trim().ToLower()
+          $actorName   = "$(Build.RequestedFor)".Trim()
+          $buildReason = "$(Build.Reason)".Trim()
+
+          # PR validation may provide only the actor alias in Build.RequestedFor,
+          # while Build.RequestedForEmail is blank.
+          if ([string]::IsNullOrWhiteSpace($actorEmail)) {
+            if (-not [string]::IsNullOrWhiteSpace($actorName) -and $actorName -notmatch '@') {
+              $actorEmail = "$($actorName.Trim().ToLower())@lab.local"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($actorName)) {
+              $actorEmail = $actorName.Trim().ToLower()
+            }
+          }
+          elseif ($actorEmail -notmatch '@') {
+            $actorEmail = "$actorEmail@lab.local"
+          }
+
+          Write-Host "======================================"
+          Write-Host " Governance-of-governance gate (Option A hardened)"
+          Write-Host "======================================"
+          Write-Host "Owners file : $ownersFile"
+          Write-Host "Actor       : $actorName <$actorEmail>"
+          Write-Host "BuildReason : $buildReason"
+          Write-Host ""
+
+          Write-Host "DEBUG Build.RequestedFor      = '$(Build.RequestedFor)'"
+          Write-Host "DEBUG Build.RequestedForEmail = '$(Build.RequestedForEmail)'"
+          Write-Host "DEBUG Resolved actorName      = '$actorName'"
+          Write-Host "DEBUG Resolved actorEmail     = '$actorEmail'"
+          Write-Host ""
+
+          if (-not (Test-Path -LiteralPath $ownersFile)) {
+            throw "Ownership file not found in working tree: $ownersFile"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($actorEmail)) {
+            throw "Unable to determine actor email."
+          }
+
+          # ------------------------------------------------------------
+          # Only enforce if owners.yml actually changed in this build context
+          # ------------------------------------------------------------
+          $hasParent = $true
+          try { git rev-parse HEAD^1 | Out-Null } catch { $hasParent = $false }
+
+          if ($hasParent) {
+            $changedOwners = @(
+              git diff --name-only HEAD^1..HEAD -- $ownersFile |
+                Where-Object { $_ -and $_.Trim().Length -gt 0 }
+            )
+          } else {
+            $changedOwners = @($ownersFile)
+          }
+
+          if ($changedOwners.Count -eq 0) {
+            Write-Host "No change detected in $ownersFile for this build context. Exiting gate."
+            exit 0
+          }
+
+          # ------------------------------------------------------------
+          # Owners.yml parsing helper (STRICT wrapper + safe empty owners)
+          # ------------------------------------------------------------
+          function Get-OwnersList {
+            param(
+              [Parameter(Mandatory)][string]$EnvKeyLower,
+              [Parameter(Mandatory)][string]$Raw,
+              [Parameter(Mandatory)][string]$OwnersPath
+            )
+
+            $rawN = $Raw -replace "`r`n", "`n"
+
+            # Capture ONLY the environments: block (children indented)
+            $pRoot = "(?ms)^\s*environments\s*:\s*\n(?<envs>(?:^(?: {2}|\t).*\n)+)"
+            $mRoot = [regex]::Match($rawN, $pRoot)
+
+            if ($mRoot.Success) {
+              $envs = $mRoot.Groups["envs"].Value
+
+              # Capture ONLY this environment section (stop at next env key)
+              $pSec = "(?ms)^(?: {2}|\t)${EnvKeyLower}\s*:\s*\n(?<section>(?:^(?: {4}|\t\t).*\n)*)"
+              $mSec = [regex]::Match($envs, $pSec)
+              if (-not $mSec.Success) { throw "No environment block found for '$EnvKeyLower' in $OwnersPath (under environments:)." }
+
+              $section = $mSec.Groups["section"].Value
+
+              # owners: may exist with EMPTY list (bootstrap case)
+              $pOwners = "(?ms)^(?: {4}|\t\t)owners\s*:\s*\n(?<list>(?:^(?: {6}|\t\t\t)-\s*[^\n]+\n)*)"
+              $mOwners = [regex]::Match($section, $pOwners)
+              if (-not $mOwners.Success) {
+                throw "No 'owners:' key found for environment '$EnvKeyLower' in $OwnersPath."
+              }
+
+              $list = $mOwners.Groups["list"].Value
+              if ([string]::IsNullOrWhiteSpace($list)) {
+                return @()
+              }
+
+              return @(
+                ($list -split "\n") |
+                  ForEach-Object { $_.Trim() } |
+                  Where-Object { $_ -like "- *" } |
+                  ForEach-Object { $_.Substring(2).Trim().ToLower() }
+              )
+            }
+
+            # Legacy root-level format fallback (only if NO environments: wrapper)
+            $pLegacy = "(?ms)^\s*${EnvKeyLower}\s*:\s*\n(?<section>(?:^\s+.*\n)*)"
+            $mLegacy = [regex]::Match($rawN, $pLegacy)
+            if (-not $mLegacy.Success) { throw "No environment block found for '$EnvKeyLower' in $OwnersPath." }
+
+            $sec2 = $mLegacy.Groups["section"].Value
+            $pOwners2 = "(?ms)^\s*owners\s*:\s*\n(?<list>(?:^\s*-\s*[^\n]+\n)*)"
+            $mOwners2 = [regex]::Match($sec2, $pOwners2)
+            if (-not $mOwners2.Success) { throw "No 'owners:' key found for environment '$EnvKeyLower' in $OwnersPath." }
+
+            $list2 = $mOwners2.Groups["list"].Value
+            if ([string]::IsNullOrWhiteSpace($list2)) { return @() }
+
+            return @(
+              ($list2 -split "\n") |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -like "- *" } |
+                ForEach-Object { $_.Substring(2).Trim().ToLower() }
+            )
+          }
+
+          Write-Host "[GOV-OWNERSHIP] $ownersFile changed - enforcing governance owner approval."
+          Write-Host ""
+
+          # ------------------------------------------------------------
+          # Choose auth source
+          # - PR build: read owners.yml from origin/main
+          # - main build: read from working tree
+          # ------------------------------------------------------------
+          $authRaw = $null
+          $authSource = "HEAD"
+
+          # git fetch origin +refs/heads/*:refs/remotes/origin/* | Out-Null
+          git fetch origin main --depth=1 | Out-Null
+
+          if ($buildReason -eq "PullRequest") {
+            $authSource = "origin/main"
+            try {
+              $authRaw = (git show "origin/main:$ownersFile" | Out-String)
+              $authRaw = $authRaw.TrimEnd()
+            } catch {
+              throw "Unable to read $ownersFile from $authSource."
+            }
+          } else {
+            $authRaw = Get-Content -LiteralPath $ownersFile -Raw
+          }
+
+          $authRaw = $authRaw -replace "`r`n", "`n"
+
+          Write-Host "AUTH SOURCE (governance owners): $authSource"
+          Write-Host ""
+
+          $govOwners = @(Get-OwnersList -EnvKeyLower "governance" -Raw $authRaw -OwnersPath $ownersFile)
+
+          if (-not $govOwners -or $govOwners.Count -eq 0) {
+            $msg = @(
+              "GOVERNANCE BOOTSTRAP REQUIRED",
+              "",
+              "File       : $ownersFile",
+              "Actor      : $actorName <$actorEmail>",
+              "AuthSource : $authSource",
+              "",
+              "No governance owners are currently defined under:",
+              "  environments:",
+              "    governance:",
+              "      owners:",
+              "",
+              "This file is protected, but there is nobody authorised to change it.",
+              "",
+              "Recovery:",
+              " - Use break-glass (bypass policies) to add the first governance owner on main.",
+              "",
+              "Result:",
+              " - This PR is blocked until governance owners are defined."
+            ) -join "`n"
+
+            Write-Host "##vso[task.logissue type=error]$msg"
+            throw "Blocked: governance owners are not defined (bootstrap required)."
+          }
+
+          Write-Host "Governance owners (from $authSource):"
+          $govOwners | Sort-Object | ForEach-Object { Write-Host " - $_" }
+          Write-Host ""
+
+          if ($govOwners -notcontains $actorEmail) {
+            $ownersText = ($govOwners | Sort-Object | ForEach-Object { " - $_" }) -join "`n"
+
+            $msg = @(
+              "GOVERNANCE BLOCK",
+              "",
+              "File       : $ownersFile",
+              "Actor      : $actorName <$actorEmail>",
+              "AuthSource : $authSource",
+              "",
+              "Only governance owners may change this file:",
+              $ownersText,
+              "",
+              "Terraform execution is not involved; this is a pure governance gate."
+            ) -join "`n"
+
+            Write-Host "##vso[task.logissue type=error]$msg"
+            throw "Blocked: actor is not a governance owner."
+          }
+
+          Write-Host "[GOV-OWNERSHIP] Actor is a governance owner - OK."
+          Write-Host "Governance-of-governance gate PASSED."

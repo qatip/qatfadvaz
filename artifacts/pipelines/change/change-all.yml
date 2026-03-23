@@ -1,0 +1,279 @@
+# PIPELINE_TYPE: promote
+# PIPELINE_VERSION: v1
+# INTRODUCED_IN_LAB: 6b
+
+# DESCRIPTION:
+#   Single promotion pipeline enforcing environment ordering (dev → test → prod).
+#   Promotion is evaluated on environment state by comparing module version pins
+#   across all governed modules.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - envs/**
+
+variables:
+- group: vg-terraform-backend
+
+pool:
+  name: "Default"
+
+stages:
+# ------------------------------------------------------------
+# Apply DEV
+# ------------------------------------------------------------
+- stage: Apply_Dev
+  displayName: "Apply - dev"
+  jobs:
+  - deployment: dev_apply
+    displayName: "Terraform apply (dev)"
+    environment: "dev"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Terraform init + plan + apply (dev)"
+            inputs:
+              azureSubscription: "sc-terraform-lab"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                # Terraform auth via Service Principal secret
+                $env:ARM_CLIENT_ID       = $env:servicePrincipalId
+                $env:ARM_CLIENT_SECRET   = $env:servicePrincipalKey
+                $env:ARM_TENANT_ID       = $env:tenantId
+                $env:ARM_SUBSCRIPTION_ID = "$(ARM_SUBSCRIPTION_ID)"
+
+                if ([string]::IsNullOrWhiteSpace($env:ARM_CLIENT_SECRET)) {
+                throw "ARM_CLIENT_SECRET is empty. The AzureCLI task did not expose servicePrincipalKey."
+                }
+
+                cd "envs/dev"
+
+                terraform --version
+
+                terraform init -reconfigure `
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" `
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" `
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" `
+                  -backend-config="key=dev.tfstate"
+
+                terraform validate
+
+                # Use a temp plan path to avoid stale plan/version mismatch
+                $planPath = "$(Agent.TempDirectory)\tfplan-dev"
+                terraform plan -no-color -input=false -out $planPath
+                terraform apply -no-color -input=false -auto-approve $planPath
+
+
+# ------------------------------------------------------------
+# Apply TEST (approval + version gate)
+# ------------------------------------------------------------
+- stage: Apply_Test
+  displayName: "Apply - test (approval)"
+  dependsOn: Apply_Dev
+  condition: eq(dependencies.Apply_Dev.result, 'Succeeded')
+
+  jobs:
+  - deployment: test_apply
+    displayName: "Terraform apply (test)"
+    environment: "test"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: "Gate: block test if ahead of dev (all governed modules)"
+            inputs:
+              targetType: inline
+              script: |
+                $ErrorActionPreference = "Stop"
+
+                function Get-ModuleRefVersion($envPath, $moduleName) {
+                  $mainTf = Join-Path $envPath "main.tf"
+                  if (-not (Test-Path $mainTf)) { throw "Missing file: $mainTf" }
+
+                  $content = Get-Content -Raw $mainTf
+
+                  $pattern = "(?is)module\s+`"$moduleName`"\s*\{.*?source\s*=\s*`"[^`"]*\?ref=v?(\d+\.\d+\.\d+)[^`"]*`".*?\}"
+                  $m = [regex]::Match($content, $pattern)
+
+                  if (-not $m.Success) {
+                    throw "Could not find module `"$moduleName`" with a source ref in $mainTf"
+                  }
+
+                  return $m.Groups[1].Value
+                }
+
+                function Assert-NotAhead($lowerEnvName, $lowerEnvPath, $upperEnvName, $upperEnvPath) {
+                  # Governed platform modules
+                  $modules = @("network", "security")
+
+                  Write-Host "Detected module versions (from main.tf):"
+                  foreach ($mod in $modules) {
+                    $lowerVer = Get-ModuleRefVersion $lowerEnvPath $mod
+                    $upperVer = Get-ModuleRefVersion $upperEnvPath $mod
+
+                    Write-Host ("  {0,-8} {1}={2}  {3}={4}" -f $mod, $lowerEnvName, $lowerVer, $upperEnvName, $upperVer)
+
+                    if ([version]$upperVer -gt [version]$lowerVer) {
+                      throw "Promotion blocked: $upperEnvName $mod ($upperVer) is ahead of $lowerEnvName $mod ($lowerVer). Promote in order."
+                    }
+                  }
+
+                  Write-Host "Gate passed: $upperEnvName is not ahead of $lowerEnvName for any governed module."
+                }
+
+                $devPath  = "$(Build.SourcesDirectory)\envs\dev"
+                $testPath = "$(Build.SourcesDirectory)\envs\test"
+
+                Assert-NotAhead -lowerEnvName "dev" -lowerEnvPath $devPath -upperEnvName "test" -upperEnvPath $testPath
+
+          - task: AzureCLI@2
+            displayName: "Terraform init + plan + apply (dev)"
+            inputs:
+              azureSubscription: "sc-terraform-lab"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                # Terraform auth via Service Principal secret
+                $env:ARM_CLIENT_ID       = $env:servicePrincipalId
+                $env:ARM_CLIENT_SECRET   = $env:servicePrincipalKey
+                $env:ARM_TENANT_ID       = $env:tenantId
+                $env:ARM_SUBSCRIPTION_ID = "$(ARM_SUBSCRIPTION_ID)"
+
+                if ([string]::IsNullOrWhiteSpace($env:ARM_CLIENT_SECRET)) {
+                throw "ARM_CLIENT_SECRET is empty. The AzureCLI task did not expose servicePrincipalKey."
+                }
+
+                cd "envs/test"
+
+                terraform --version
+
+                terraform init -reconfigure `
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" `
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" `
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" `
+                  -backend-config="key=test.tfstate"
+
+                terraform validate
+
+                # Use a temp plan path to avoid stale plan/version mismatch
+                $planPath = "$(Agent.TempDirectory)\tfplan-test"
+                terraform plan -no-color -input=false -out $planPath
+                terraform apply -no-color -input=false -auto-approve $planPath
+
+# ------------------------------------------------------------
+# Apply PROD (approval + version gate)
+# ------------------------------------------------------------
+- stage: Apply_Prod
+  displayName: "Apply - prod (approval)"
+  dependsOn: Apply_Test
+  condition: eq(dependencies.Apply_Test.result, 'Succeeded')
+
+  jobs:
+  - deployment: prod_apply
+    displayName: "Terraform apply (prod)"
+    environment: "prod"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: "Gate: block prod if ahead of test (all governed modules)"
+            inputs:
+              targetType: inline
+              script: |
+                $ErrorActionPreference = "Stop"
+
+                function Get-ModuleRefVersion($envPath, $moduleName) {
+                  $mainTf = Join-Path $envPath "main.tf"
+                  if (-not (Test-Path $mainTf)) { throw "Missing file: $mainTf" }
+
+                  $content = Get-Content -Raw $mainTf
+
+                  $pattern = "(?is)module\s+`"$moduleName`"\s*\{.*?source\s*=\s*`"[^`"]*\?ref=v?(\d+\.\d+\.\d+)[^`"]*`".*?\}"
+                  $m = [regex]::Match($content, $pattern)
+
+                  if (-not $m.Success) {
+                    throw "Could not find module `"$moduleName`" with a source ref in $mainTf"
+                  }
+
+                  return $m.Groups[1].Value
+                }
+
+                function Assert-NotAhead($lowerEnvName, $lowerEnvPath, $upperEnvName, $upperEnvPath) {
+                  $modules = @("network", "security")
+
+                  Write-Host "Detected module versions (from main.tf):"
+                  foreach ($mod in $modules) {
+                    $lowerVer = Get-ModuleRefVersion $lowerEnvPath $mod
+                    $upperVer = Get-ModuleRefVersion $upperEnvPath $mod
+
+                    Write-Host ("  {0,-8} {1}={2}  {3}={4}" -f $mod, $lowerEnvName, $lowerVer, $upperEnvName, $upperVer)
+
+                    if ([version]$upperVer -gt [version]$lowerVer) {
+                      throw "Promotion blocked: $upperEnvName $mod ($upperVer) is ahead of $lowerEnvName $mod ($lowerVer). Promote in order."
+                    }
+                  }
+
+                  Write-Host "Gate passed: $upperEnvName is not ahead of $lowerEnvName for any governed module."
+                }
+
+                $testPath = "$(Build.SourcesDirectory)\envs\test"
+                $prodPath = "$(Build.SourcesDirectory)\envs\prod"
+
+                Assert-NotAhead -lowerEnvName "test" -lowerEnvPath $testPath -upperEnvName "prod" -upperEnvPath $prodPath
+
+          - task: AzureCLI@2
+            displayName: "Terraform init + plan + apply (dev)"
+            inputs:
+              azureSubscription: "sc-terraform-lab"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                # Terraform auth via Service Principal secret
+                $env:ARM_CLIENT_ID       = $env:servicePrincipalId
+                $env:ARM_CLIENT_SECRET   = $env:servicePrincipalKey
+                $env:ARM_TENANT_ID       = $env:tenantId
+                $env:ARM_SUBSCRIPTION_ID = "$(ARM_SUBSCRIPTION_ID)"
+
+                if ([string]::IsNullOrWhiteSpace($env:ARM_CLIENT_SECRET)) {
+                throw "ARM_CLIENT_SECRET is empty. The AzureCLI task did not expose servicePrincipalKey."
+                }
+
+                cd "envs/prod"
+
+                terraform --version
+
+                terraform init -reconfigure `
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" `
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" `
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" `
+                  -backend-config="key=prod.tfstate"
+
+                terraform validate
+
+                # Use a temp plan path to avoid stale plan/version mismatch
+                $planPath = "$(Agent.TempDirectory)\tfplan-prod"
+                terraform plan -no-color -input=false -out $planPath
+                terraform apply -no-color -input=false -auto-approve $planPath

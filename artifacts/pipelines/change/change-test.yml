@@ -1,0 +1,629 @@
+#####################################################################
+#                                                                   # 
+#   Version: V1.0.1                                                 #
+#   Author: Michael Coulling-Green                                  #
+#   PIPELINE_TYPE: promote with governance                          #
+#                                                                   #   
+#   Promote pipeline used across multiple lab phases.               #
+#   Behaviour is controlled via feature flag.                       #
+#                                                                   #
+#   Phase mapping (FEATURE_PHASE):                                  #
+#   1 - No governance                                               #  
+#   2 - Intent governance (classify + enforce)                      #
+#   3 - Intent + Ownership governance                               #
+#                                                                   #
+#####################################################################
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - envs/test/**
+
+variables:
+- name: FEATURE_PHASE
+  value: "1"  # 1=No governance, 2=Intent governance, 3=Intent + Ownership
+- group: vg-terraform-backend
+- name: ENV_DIR
+  value: "envs/test"
+- name: EXPECTED_ENV
+  value: "test"
+- name: PROMOTION_TFVARS
+  value: "envs/test/test-promotion.tfvars"
+- name: STATE_KEY
+  value: "test.tfstate"
+- name: VAR_FILE
+  value: "test.tfvars"
+
+pool:
+  name: Default
+
+stages:
+- stage: Apply_Test
+  displayName: "Apply – Test"
+  jobs:
+  - deployment: test_apply
+    displayName: "Test Apply"
+    environment: "test"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: AzureCLI@2
+            displayName: "Governance gate + Terraform (test)"
+            inputs:
+              azureSubscription: "sc-terraform-lab"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                # If you need a pause for debugging, prefer .NET sleep here (Start-Sleep can be flaky in AzureCLI@2 inline scripts)
+                # [System.Threading.Thread]::Sleep(300000)
+
+                # -----------------
+                # Context + paths
+                # -----------------
+                $envDir     = "$(ENV_DIR)"
+                $envKey     = "$(EXPECTED_ENV)"
+                $intentFile = "$(PROMOTION_TFVARS)"
+                $stateKey   = "$(STATE_KEY)"
+                $varFile    = "$(VAR_FILE)"
+                $mainTf     = Join-Path $envDir "main.tf"
+                $ownersFile = "governance/owners.yml"
+                $actorEmail = "$(Build.RequestedForEmail)".Trim().ToLower()
+                $actorName  = "$(Build.RequestedFor)".Trim()
+
+                if ([string]::IsNullOrWhiteSpace($actorEmail)) {
+                  if (-not [string]::IsNullOrWhiteSpace($actorName) -and $actorName -notmatch '@') {
+                    $actorEmail = "$($actorName.Trim().ToLower())@lab.local"
+                  }
+                    elseif (-not [string]::IsNullOrWhiteSpace($actorName)) {
+                      $actorEmail = $actorName.Trim().ToLower()
+                    }
+                  }
+                elseif ($actorEmail -notmatch '@') {
+                  $actorEmail = "$actorEmail@lab.local"
+                }
+
+                # ------------------
+                # Four-phase model 
+                # ------------------
+                $phaseRaw = "$(FEATURE_PHASE)".Trim()
+                if ([string]::IsNullOrWhiteSpace($phaseRaw)) { $phaseRaw = "1" }
+
+                try { $phase = [int]$phaseRaw } catch { throw "Invalid FEATURE_PHASE value: '$phaseRaw' (expected 1, 2, 3, or 4)." }
+                if ($phase -lt 1 -or $phase -gt 4) { throw "Invalid FEATURE_PHASE value: '$phaseRaw' (expected 1, 2, 3, or 4)." }
+
+                $enableIntent     = $phase -ge 2
+                $enableOwners     = $phase -ge 3
+                # $enableGovOwners  = $phase -ge 4
+
+                # In this simplified model:
+                # - Phase 2+ enables BOTH classification and enforcement of intent rules.
+                # - Phase 3 adds ownership checks on top.
+                # - Phase 4 adds governance-of-governance checks for owners.yml changes.
+                $enableClassify   = $enableIntent
+                $enableBlockBad   = $enableIntent
+                $enableMixedWarn  = $enableIntent
+                $enableRefCompare = $enableIntent
+
+                # -------
+                # Header
+                # -------
+                Write-Host "======================================"
+                Write-Host " Promote pipeline (TEST)"
+                Write-Host "======================================"
+                Write-Host "Environment directory : $envDir"
+                Write-Host "Main.tf               : $mainTf"
+                Write-Host "Intent file           : $intentFile"
+                Write-Host "Owners file           : $ownersFile"
+                Write-Host "Actor                 : $actorName <$actorEmail>"
+                Write-Host ""
+
+                Write-Host "Promote phase:"
+                switch ($phase) {
+                  1 { Write-Host " - PHASE             : 1 (No governance; Terraform always runs)" }
+                  2 { Write-Host " - PHASE             : 2 (Intent governance; malformed promotions blocked)" }
+                  3 { Write-Host " - PHASE             : 3 (Intent + Ownership governance)" }
+                  # 4 { Write-Host " - PHASE             : 4 (Intent + Ownership + Governance-of-governance)" }
+                }
+                Write-Host ""
+
+                Write-Host "Enabled features:"
+                Write-Host " - INTENT (classify) : $enableClassify"
+                Write-Host " - INTENT (enforce)  : $enableBlockBad"
+                Write-Host " - MIXED WARNING     : $enableMixedWarn"
+                Write-Host " - REF MATCH CHECK   : $enableRefCompare"
+                Write-Host " - OWNERSHIP         : $enableOwners"
+                # Write-Host " - GOV-OWNERSHIP     : $enableGovOwners"
+                Write-Host ""
+
+                if (-not (Test-Path -LiteralPath $mainTf)) { throw "main.tf not found under $envDir." }
+                if ($enableOwners) {
+                  if (-not (Test-Path -LiteralPath $ownersFile)) {
+                    throw "Ownership file not found: $ownersFile. Environment ownership is not defined."
+                  }
+                }
+
+                # ============================================================
+                # Defaults (safe baseline)
+                # ============================================================
+                $changeType    = "ENV_ROOT_CHANGE"
+                $allowedOwners = New-Object System.Collections.Generic.List[string]
+                $refChanged    = $false
+                $hasParent     = $true
+
+                # (arrays for predictable .Count usage)
+                $changedIntent = @()
+                $changedOwners = @()
+
+                # ============================================================
+                # Owners.yml parsing helper (supports environments: wrapper)
+                # ============================================================
+                function Get-OwnersList {
+                  param(
+                    [Parameter(Mandatory)][string]$EnvKeyLower,
+                    [Parameter(Mandatory)][string]$Raw,
+                    [Parameter(Mandatory)][string]$OwnersPath
+                  )
+
+                  $rawN = $Raw -replace "`r`n", "`n"
+
+                  # Preferred format:
+                  # environments:
+                  #   test:
+                  #     owners:
+                  #       - user@...
+                  $p1 = "(?ms)^\s*environments\s*:\s*\n(?<envs>(?:\s{2,}.*\n)+)"
+                  $m1 = [regex]::Match($rawN, $p1)
+                  if ($m1.Success) {
+                    $envs = $m1.Groups["envs"].Value
+
+                    $pEnv = "(?ms)^\s{2,}${EnvKeyLower}\s*:\s*\n(?<body>(?:\s{4,}.*\n)+)"
+                    $mEnv = [regex]::Match($envs, $pEnv)
+                    if (-not $mEnv.Success) { throw "No owners defined for environment '$EnvKeyLower' in $OwnersPath" }
+
+                    $body = $mEnv.Groups["body"].Value
+                    $pOwners = "(?ms)^\s{4,}owners\s*:\s*\n(?<list>(?:\s{6,}-\s*[^\n]+\n)+)"
+                    $mOwners = [regex]::Match($body, $pOwners)
+                    if (-not $mOwners.Success) { throw "No owners defined for environment '$EnvKeyLower' in $OwnersPath" }
+
+                    return @(
+                      ($mOwners.Groups["list"].Value -split "\n") |
+                        ForEach-Object { $_.Trim() } |
+                        Where-Object { $_ -like "- *" } |
+                        ForEach-Object { $_.Substring(2).Trim().ToLower() }
+                    )
+                  }
+
+                  # Legacy format (root-level env blocks):
+                  $p2 = "(?ms)^\s*${EnvKeyLower}\s*:\s*\n\s*owners\s*:\s*\n(?<list>(?:\s*-\s*[^\r\n]+\s*\n)+)"
+                  $m2 = [regex]::Match($rawN, $p2)
+                  if (-not $m2.Success) { throw "No owners defined for environment '$EnvKeyLower' in $OwnersPath" }
+
+                  return @(
+                    ($m2.Groups["list"].Value -split "\n") |
+                      ForEach-Object { $_.Trim() } |
+                      Where-Object { $_ -like "- *" } |
+                      ForEach-Object { $_.Substring(2).Trim().ToLower() }
+                  )
+                }
+
+                # ============================================================
+                # Ownership model — parse allowed owners from governance/owners.yml
+                # ============================================================
+                $envKeyLower = $envKey.Trim().ToLower()
+                if (-not $enableOwners) {
+                  Write-Host "[OWNERSHIP] Feature disabled in current phase."
+                  Write-Host ""
+                } else {
+                  $raw = Get-Content -LiteralPath $ownersFile -Raw
+                  $raw = $raw -replace "`r`n", "`n"
+
+                  $vals = @(Get-OwnersList -EnvKeyLower $envKeyLower -Raw $raw -OwnersPath $ownersFile)
+                  foreach ($v in $vals) {
+                    $t = ($v -replace "[\uFEFF\u200B\u200C\u200D]", "").Trim().ToLower()
+                    if (-not [string]::IsNullOrWhiteSpace($t)) { $allowedOwners.Add($t) }
+                  }
+                  if ($allowedOwners.Count -eq 0) { throw "No owners defined for environment '$envKeyLower' in $ownersFile" }
+
+                  Write-Host "Allowed owners ($envKeyLower):"
+                  $allowedOwners | Sort-Object | ForEach-Object { Write-Host " - $_" }
+                  Write-Host ""
+                }
+
+                # ============================================================
+                # Promotion intent validation — helper function
+                # ============================================================
+                function Validate-PromotionIntent {
+                  param(
+                    [Parameter(Mandatory=$true)][string]$IntentFile,
+                    [Parameter(Mandatory=$true)][string]$MainTf,
+                    [Parameter(Mandatory=$true)][string]$ExpectedEnv
+                  )
+
+                  if (-not (Test-Path -LiteralPath $IntentFile)) { throw "Promotion intent file not found: $IntentFile. Promotion is not explicitly declared." }
+                  if (-not (Test-Path -LiteralPath $MainTf))     { throw "Main Terraform file not found: $MainTf (used only to locate env root)." }
+
+                  $intentRaw = Get-Content -LiteralPath $IntentFile -Raw
+
+                  # Scan ALL .tf files under the env root (not just main.tf)
+                  $envRoot = Split-Path -Parent $MainTf
+                  $tfFiles = Get-ChildItem -LiteralPath $envRoot -Filter *.tf -File -Recurse
+                  if (-not $tfFiles -or $tfFiles.Count -eq 0) { throw "No .tf files found under env root: $envRoot" }
+
+                  $allTfRaw = ($tfFiles | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+
+                  Write-Host "=== Promotion intent validation ==="
+
+                  $envMatch = [regex]::Match($intentRaw, '(?m)^\s*promotion_environment\s*=\s*"?([^"\r\n]+)"?\s*$')
+                  if (-not $envMatch.Success) { throw "promotion_environment is missing from $IntentFile." }
+
+                  $declaredEnv = $envMatch.Groups[1].Value.Trim()
+                  if ($declaredEnv -ne $ExpectedEnv) {
+                    throw "Intent mismatch: promotion_environment='$declaredEnv' does not match pipeline target '$ExpectedEnv'."
+                  }
+
+                  Write-Host "Declared environment     : $declaredEnv"
+
+                  $mapMatch = [regex]::Match($intentRaw, '(?s)approved_refs\s*=\s*\{(.*?)\}')
+                  if (-not $mapMatch.Success) { throw "approved_refs map not found in $IntentFile." }
+
+                  $approved = @{}
+                  foreach ($pair in [regex]::Matches($mapMatch.Groups[1].Value, '(?m)^\s*([A-Za-z0-9_\-]+)\s*=\s*"?([^"\r\n]+)"?\s*$')) {
+                    $approved[$pair.Groups[1].Value.Trim()] = $pair.Groups[2].Value.Trim()
+                  }
+                  if ($approved.Count -eq 0) { throw "approved_refs exists but contains no entries." }
+
+                  Write-Host "Approved module refs:"
+                  $approved.Keys | Sort-Object | ForEach-Object { Write-Host " - $_ = $($approved[$_])" }
+
+                  $errors = @()
+
+                  foreach ($moduleName in ($approved.Keys | Sort-Object)) {
+                    $expectedRef = $approved[$moduleName]
+                    $pattern = '(?s)module\s+\"{0}\"\s*\{{.*?source\s*=\s*\"[^\"]*\?ref=([^\"&]+)[^\"]*\".*?\}}' -f [regex]::Escape($moduleName)
+                    $modMatch = [regex]::Match($allTfRaw, $pattern)
+
+                    if (-not $modMatch.Success) { $errors += "Module '$moduleName' not found with ?ref= in env root (*.tf) under $envRoot."; continue }
+
+                    $pinnedRef = $modMatch.Groups[1].Value.Trim()
+                    Write-Host "Pinned ref ($moduleName) : $pinnedRef"
+
+                    if ($pinnedRef -ne $expectedRef) {
+                      $errors += "Intent mismatch for '$moduleName': approved_refs='$expectedRef', actual='?ref=$pinnedRef'."
+                    }
+                  }
+
+                  if ($errors.Count -gt 0) { throw ($errors -join "`n") }
+
+                  Write-Host "Promotion intent validated successfully."
+                  Write-Host ""
+                }
+
+                if (-not $enableIntent) {
+                  Write-Host "[INTENT] Feature disabled in current version."
+                  Write-Host ""
+                }
+
+                # ============================================================
+                # Change classification
+                # ============================================================
+                if (-not $enableClassify) {
+                  Write-Host "[CLASSIFY] Feature disabled in current version."
+                  Write-Host ""
+                }
+                else {
+
+                  try { git rev-parse HEAD^1 | Out-Null } catch { $hasParent = $false }
+
+                  if (-not $hasParent) {
+                    Write-Host "WARNING: No parent commit found for HEAD. Defaulting to ENV_ROOT_CHANGE."
+                  }
+                  else {
+
+                    # Did the intent file change?
+                    $changedIntent = @(
+                      git diff --name-only HEAD^1..HEAD -- $intentFile |
+                        Where-Object { $_ -and $_.Trim().Length -gt 0 }
+                    )
+
+                    # Did the owners file change?
+                    $changedOwners = @(
+                      git diff --name-only HEAD^1..HEAD -- $ownersFile |
+                        Where-Object { $_ -and $_.Trim().Length -gt 0 }
+                    )
+
+                    Write-Host "DEBUG: changedIntentCount=$($changedIntent.Count)"
+                    Write-Host "DEBUG: changedOwnersCount=$($changedOwners.Count)"
+                    
+                    # -----------------------------------------------
+                    # Build ref maps BEFORE and AFTER
+                    # -----------------------------------------------
+                    function Get-ModuleRefMap {
+                      param(
+                        [Parameter(Mandatory)][string]$Commit,
+                        [Parameter(Mandatory)][string]$EnvDir
+                      )
+
+                      $map = @{}
+                      $tfFiles = git ls-tree -r --name-only $Commit -- "$EnvDir/" |
+                                Where-Object { $_ -match '\.tf$' }
+
+                      foreach ($f in $tfFiles) {
+                        try { $content = git show "${Commit}:${f}" } catch { continue }
+
+                        $rx = '(?s)module\s+"(?<name>[^"]+)"\s*\{.*?source\s*=\s*"[^"]*\?ref=(?<ref>[^"&]+)'
+                        foreach ($m in [regex]::Matches($content, $rx)) {
+                          $map[$m.Groups["name"].Value.Trim()] = $m.Groups["ref"].Value.Trim()
+                        }
+                      }
+                      return $map
+                    }
+
+                    # -----------------------------------------------
+                    # Detect promotion-shaped module changes across the WHOLE env root
+                    #   - ref value changed for an existing pinned module
+                    #   - pinned module added/removed (inventory drift)
+                    # -----------------------------------------------
+                    $before = Get-ModuleRefMap "HEAD^1" $envDir
+                    $after  = Get-ModuleRefMap "HEAD"   $envDir
+
+                    $moduleSetChanged = $false
+                    $refValueChanged  = $false
+
+                    # Inventory drift (added/removed modules)
+                    $beforeKeys = @($before.Keys)
+                    $afterKeys  = @($after.Keys)
+
+                    $added   = @($afterKeys  | Where-Object { -not $before.ContainsKey($_) })
+                    $removed = @($beforeKeys | Where-Object { -not $after.ContainsKey($_) })
+                    if ($added.Count -gt 0 -or $removed.Count -gt 0) { $moduleSetChanged = $true }
+
+                    # Ref value drift (same module, different ref)
+                    foreach ($m in $beforeKeys) {
+                      if ($after.ContainsKey($m) -and $before[$m] -ne $after[$m]) {
+                        $refValueChanged = $true
+                        break
+                      }
+                    }
+
+                    $promotionShaped = ($moduleSetChanged -or $refValueChanged)
+
+                    # -----------------------------------------------
+                    # Parse approved_refs from the intent tfvars
+                    # approved_refs = { network = "v1.0.1" ... }
+                    # -----------------------------------------------
+                    function Get-ApprovedRefsFromTfvars([string]$path) {
+                      $approved = @{}
+                      if (-not (Test-Path $path)) { return $approved }
+                      $t = Get-Content -Raw $path
+                      $m = [regex]::Match($t, 'approved_refs\s*=\s*\{(?<body>[^}]*)\}', 'Singleline')
+                      if (-not $m.Success) { return $approved }
+                      foreach ($line in ($m.Groups["body"].Value -split "`n")) {
+                        $m2 = [regex]::Match($line, '^\s*(?<k>[A-Za-z0-9_-]+)\s*=\s*\"(?<v>[^\"]+)\"\s*$')
+                        if ($m2.Success) { $approved[$m2.Groups["k"].Value.Trim()] = $m2.Groups["v"].Value.Trim() }
+                      }
+                      return $approved
+                    }
+
+                    $approved = Get-ApprovedRefsFromTfvars $intentFile
+
+                    # Coverage check: every pinned module used in env must be declared in approved_refs and match ref
+                    $missingApproved = @()
+                    $mismatchedRefs  = @()
+                    foreach ($m in $after.Keys) {
+                      if (-not $approved.ContainsKey($m)) {
+                        $missingApproved += $m
+                      } elseif ($approved[$m] -ne $after[$m]) {
+                        $mismatchedRefs += ("{0} (approved={1} actual={2})" -f $m, $approved[$m], $after[$m])
+                      }
+                    }
+                    $refsCoveredByIntent = (($missingApproved.Count -eq 0) -and ($mismatchedRefs.Count -eq 0))
+
+                    # -----------------------
+                    # Classification matrix
+                    # -----------------------
+                    if ($promotionShaped) {
+                      if ($refsCoveredByIntent -and $changedIntent.Count -gt 0) {
+                        $changeType = "PROMOTION_INTENT"
+                      } else {
+                        # Promotion-shaped change without explicit, matching intent in the same commit
+                        $changeType = "IMPLICIT_PROMOTION_ATTEMPT"
+                      }
+                    } elseif ($changedIntent.Count -gt 0) {
+                      $changeType = "NOOP_PROMOTION_INTENT"
+                    }
+                  }
+
+                  Write-Host "=== Change classification ==="
+                  Write-Host "DEBUG: changedIntentCount=$($changedIntent.Count)"
+                  Write-Host "DEBUG: changedOwnersCount=$($changedOwners.Count)"
+                  Write-Host "Change type : $changeType"
+                  Write-Host ""
+                }
+
+                # ============================================================
+                # [FEATURE] Malformed promotion blocking — stop implicit/no-op promotion attempts before Terraform
+                # ============================================================
+                if (-not $enableBlockBad) {
+                  Write-Host "[BLOCK] Feature disabled in current version."
+                  Write-Host ""
+                } else {
+                  if ($changeType -eq "IMPLICIT_PROMOTION_ATTEMPT") {
+                    $msg = @(
+                      "IMPLICIT PROMOTION ATTEMPT",
+                      "",
+                      "Environment : $envKey",
+                      "A module ref was changed (e.g. ?ref=...) but no corresponding update was made to the promotion intent file.",
+                      "Promotion must be explicitly declared: pinned ref change + promotion.tfvars change (same commit).",
+                      "",
+                      "Terraform execution has been blocked BEFORE init/plan/apply."
+                    ) -join "`n"
+                    Write-Host "##vso[task.logissue type=error]$msg"
+                    throw "Blocked: pinned module ref changed without explicit promotion intent."
+                  }
+
+                  if ($changeType -eq "NOOP_PROMOTION_INTENT") {
+                    $msg = @(
+                      "NO-OP PROMOTION INTENT",
+                      "",
+                      "Environment : $envKey",
+                      "The promotion intent file was updated, but no pinned module ref change was detected.",
+                      "This would record a 'promotion intent' without an actual promotion.",
+                      "",
+                      "Terraform execution has been blocked BEFORE init/plan/apply."
+                    ) -join "`n"
+                    Write-Host "##vso[task.logissue type=error]$msg"
+                    throw "Blocked: promotion intent updated without a pinned module ref change."
+                  }
+                }
+
+                # ============================================================
+                # Ownership enforcement 
+                # ============================================================
+                if ($enableOwners) {
+
+                  if ($changeType -eq "ENV_ROOT_CHANGE") {
+
+                    Write-Host "=== Environment change governance ==="
+                    Write-Host "Accountable actor       : $actorName <$actorEmail>"
+
+                    if ([string]::IsNullOrWhiteSpace($actorEmail)) {
+                      throw "Unable to determine actor email (Build.RequestedForEmail)."
+                    }
+
+                    if ($allowedOwners -notcontains $actorEmail) {
+                      $msg = @(
+                        "UNAUTHORISED ENVIRONMENT CHANGE",
+                        "",
+                        "Environment : $envKey",
+                        "Actor       : $actorName <$actorEmail>",
+                        "",
+                        "This environment may only be changed by:",
+                        ($allowedOwners | Sort-Object | ForEach-Object { $_ }),
+                        "",
+                        "Terraform execution has been blocked BEFORE init/plan/apply."
+                      ) -join "`n"
+                      Write-Host "##vso[task.logissue type=error]$msg"
+                      throw "Ownership violation: actor is not permitted to change $envKey."
+                    }
+
+                    Write-Host "Environment change governance PASSED."
+                    Write-Host ""
+                  }
+
+                  if ($changeType -eq "PROMOTION_INTENT") {
+
+                    Write-Host "=== Promotion governance (Ownership) ==="
+
+                    # author of most recent commit that modified the intent file
+                    $authorRaw = git log -1 --format="%ae|%an" -- $intentFile
+                    if ([string]::IsNullOrWhiteSpace($authorRaw)) { throw "Unable to determine author of intent file: $intentFile" }
+
+                    $authorEmail, $authorName2 = $authorRaw.Split("|", 2)
+                    $authorEmail = $authorEmail.Trim().ToLower()
+                    $authorName2 = $authorName2.Trim()
+
+                    Write-Host "Intent author           : $authorName2 <$authorEmail>"
+
+                    if ($allowedOwners -notcontains $authorEmail) {
+                      $msg = @(
+                        "UNAUTHORISED PROMOTION INTENT",
+                        "",
+                        "Environment : $envKey",
+                        "Intent file  : $intentFile",
+                        "Author       : $authorName2 <$authorEmail>",
+                        "",
+                        "This environment may only be promoted by:",
+                        ($allowedOwners | Sort-Object | ForEach-Object { $_ }),
+                        "",
+                        "Terraform execution has been blocked BEFORE init/plan/apply."
+                      ) -join "`n"
+                      Write-Host "##vso[task.logissue type=error]$msg"
+                      throw "Ownership violation: intent author is not permitted to promote $envKey."
+                    }
+
+                    Write-Host "Ownership validation PASSED."
+                    Write-Host ""
+                  }
+                }
+
+                # ------------------------
+                # Mixed-change visibility 
+                # -----------------------
+                if (-not $enableMixedWarn) {
+                  Write-Host "[MIXED] Feature disabled in current version."
+                  Write-Host ""
+                } else {
+                  if ($changeType -eq "PROMOTION_INTENT" -and $hasParent) {
+
+                    $envDirNormalized = $envDir.TrimEnd('\','/').Replace('\','/')
+                    $mainTfNormalized = $mainTf.Replace('\','/')
+                    $intentNormalized = $intentFile.Replace('\','/')
+
+                    $allEnvChanges = @(git diff --name-only HEAD^1..HEAD -- "${envDirNormalized}/")
+                    $extraEnvChanges = @($allEnvChanges | Where-Object {
+                      $_ -and $_ -ne $mainTfNormalized -and $_ -ne $intentNormalized
+                    })
+
+                    if ($extraEnvChanges.Count -gt 0) {
+                      $msg = "PROMOTION detected. Note: Non-standard promotion and/or other changes were found in ${envDirNormalized}: $($extraEnvChanges -join ', ')"
+                      Write-Host "##vso[task.logissue type=warning]$msg"
+                      Write-Host ""
+                      $extraEnvChanges | ForEach-Object { Write-Host " - $_" }
+                      Write-Host ""
+                    }
+                  }
+                }
+
+                # ============================================================
+                # Promotion intent validation — run (PROMOTION only)
+                # ============================================================
+                if ($changeType -eq "PROMOTION_INTENT") {
+                  if (-not $enableIntent) {
+                    throw "Promotion intent validation is required for promotions, but the feature is disabled."
+                  }
+                  Validate-PromotionIntent -IntentFile $intentFile -MainTf $mainTf -ExpectedEnv $envKey
+                }
+
+                # ============================================================
+                # Terraform execution (runs only after governance)
+                # ============================================================
+                Write-Host "=== Terraform execution ==="
+                Write-Host "Change type (final)   : $changeType"
+                Write-Host ""
+
+                # Terraform auth via Service Principal secret
+                $env:ARM_CLIENT_ID       = $env:servicePrincipalId
+                $env:ARM_CLIENT_SECRET   = $env:servicePrincipalKey
+                $env:ARM_TENANT_ID       = $env:tenantId
+                $env:ARM_SUBSCRIPTION_ID = "$(ARM_SUBSCRIPTION_ID)"
+
+                if ([string]::IsNullOrWhiteSpace($env:ARM_CLIENT_SECRET)) {
+                  throw "ARM_CLIENT_SECRET is empty. The AzureCLI task did not expose servicePrincipalKey."
+                }
+
+                cd $envDir
+
+                terraform --version
+
+                terraform init -reconfigure `
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" `
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" `
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" `
+                  -backend-config="key=test.tfstate"
+
+                terraform validate
+
+                # Use a temp plan path to avoid stale plan/version mismatch
+                $planPath = "$(Agent.TempDirectory)\tfplan-test"
+                terraform plan -no-color -input=false -out $planPath
+                terraform apply -no-color -input=false -auto-approve $planPath
