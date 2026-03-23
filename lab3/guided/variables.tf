@@ -100,12 +100,11 @@ variable "subnet_cidrs" {
 }
 
 
-# -------------------------------------------------------------------
-# Callengs 2 
-#
+# ----------------------------------------------------------------------------
+# Phase 2 
 # As an extra part of the challenge, consider whether restricting VNet address
 # space to an approved list would help prevent Azure deployment errors.
-# -------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 /*
  variable "approved_vnet_cidrs" {
    type        = set(string)
