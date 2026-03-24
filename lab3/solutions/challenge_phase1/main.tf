@@ -1,4 +1,4 @@
-# Lab 3
+# Lab 4
 
 resource "azurerm_resource_group" "rg" {
   name     = "${local.prefix}-rg"
@@ -16,12 +16,12 @@ resource "azurerm_network_security_group" "nsg" {
 resource "azurerm_network_security_rule" "rule" {
   for_each = local.nsg_rules_normalised
 
-  name                   = each.key
-  priority               = each.value.priority
-  direction              = title(each.value.direction)
-  access                 = title(each.value.access)
-  protocol               = title(each.value.protocol)
-  source_port_range      = "*"
+  name                    = each.key
+  priority                = each.value.priority
+  direction               = title(each.value.direction)
+  access                  = title(each.value.access)
+  protocol                = title(each.value.protocol)
+  source_port_range       = "*"
   destination_port_ranges = each.value.destination_ports
 
   source_address_prefixes = distinct(flatten(concat(
@@ -67,7 +67,8 @@ resource "azurerm_network_security_rule" "rule" {
     }
   }
 }
-################## Nothing above here needs changing ##########################
+
+#####################################################################
 
 resource "azurerm_virtual_network" "vnet" {
   name                = "${local.prefix}-vnet"
@@ -77,16 +78,18 @@ resource "azurerm_virtual_network" "vnet" {
   tags                = local.base_tags
 }
 
-resource "azurerm_subnet" "app" {
-  name                 = "${local.prefix}-subnet-app"
+resource "azurerm_subnet" "subnet" {
+  for_each             = local.subnet_cidrs_clean
+  name                 = "${local.prefix}-subnet-${each.key}"
   resource_group_name  = azurerm_resource_group.rg.name
   virtual_network_name = azurerm_virtual_network.vnet.name
-  address_prefixes     = [var.subnet_cidrs["app"]]
+  address_prefixes     = [each.value]
 }
 
-resource "azurerm_subnet" "data" {
-  name                 = "${local.prefix}-subnet-data"
-  resource_group_name  = azurerm_resource_group.rg.name
-  virtual_network_name = azurerm_virtual_network.vnet.name
-  address_prefixes     = [var.subnet_cidrs["data"]]
+resource "azurerm_subnet_network_security_group_association" "subnet" {
+  for_each                  = azurerm_subnet.subnet
+  subnet_id                 = each.value.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
 }
+
+

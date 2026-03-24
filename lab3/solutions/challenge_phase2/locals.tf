@@ -1,6 +1,6 @@
 locals {
-  env_canon = join("-",regexall("[a-z0-9]+",lower(trimspace(var.env))))
-  project_canon = join("-",regexall("[a-z0-9]+",lower(trimspace(var.project_name))))
+  env_canon     = join("-", regexall("[a-z0-9]+", lower(trimspace(var.env))))
+  project_canon = join("-", regexall("[a-z0-9]+", lower(trimspace(var.project_name))))
   prefix        = "${local.project_canon}-${local.env_canon}"
 
   base_tags = {
@@ -29,10 +29,10 @@ locals {
   nsg_rules_normalised = {
     for name, rule in local.nsg_rules_clean :
     name => {
-      priority         = rule.priority
-      direction        = lower(rule.direction)
-      access           = lower(rule.access)
-      protocol         = lower(rule.protocol)
+      priority  = rule.priority
+      direction = lower(rule.direction)
+      access    = lower(rule.access)
+      protocol  = lower(rule.protocol)
 
       allow_groups = [
         for g in try(rule.allow_groups, []) :
@@ -47,15 +47,15 @@ locals {
         for p in try(rule.destination_ports, []) : (
           length(regexall("[^0-9 -]", trim(p, " -"))) == 0 ? (
             length(regexall("[0-9]+", trim(p, " -"))) == 1 ?
-              regexall("[0-9]+", trim(p, " -"))[0] :
+            regexall("[0-9]+", trim(p, " -"))[0] :
             length(regexall("[0-9]+", trim(p, " -"))) == 2 ?
-              "${min(
-                tonumber(regexall("[0-9]+", trim(p, " -"))[0]),
-                tonumber(regexall("[0-9]+", trim(p, " -"))[1])
+            "${min(
+              tonumber(regexall("[0-9]+", trim(p, " -"))[0]),
+              tonumber(regexall("[0-9]+", trim(p, " -"))[1])
               )}-${max(
-                tonumber(regexall("[0-9]+", trim(p, " -"))[0]),
-                tonumber(regexall("[0-9]+", trim(p, " -"))[1])
-              )}" :
+              tonumber(regexall("[0-9]+", trim(p, " -"))[0]),
+              tonumber(regexall("[0-9]+", trim(p, " -"))[1])
+            )}" :
             ""
           ) : ""
         )
@@ -63,7 +63,7 @@ locals {
 
       destination_ports_dropped = [
         for p in try(rule.destination_ports, []) : p
-        if (
+        if(
           length(trim(p, " -")) > 0 &&
           (
             length(regexall("[^0-9 -]", trim(p, " -"))) > 0 ||
@@ -83,4 +83,10 @@ locals {
 
     }
   }
+
+  subnet_cidrs_clean = {
+    for name, cidr in var.subnet_cidrs :
+    lower(trimspace(name)) => trimspace(cidr)
+  }
+
 }

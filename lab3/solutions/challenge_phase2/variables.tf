@@ -93,11 +93,13 @@ variable "vnet_address_space" {
   type        = string
   description = "CIDR for the Virtual Network address space."
 
+  # Phase 1
   validation {
     condition     = can(cidrnetmask(trimspace(var.vnet_address_space)))
     error_message = "vnet_address_space must be a valid CIDR block (e.g. 10.0.0.0/16)."
   }
 
+  # Phase 2
   validation {
     condition     = contains(var.approved_vnet_cidrs, trimspace(var.vnet_address_space))
     error_message = "vnet_address_space must be one of the approved CIDRs for this lab (see approved_vnet_cidrs)."
@@ -109,14 +111,14 @@ variable "subnet_cidrs" {
   type        = map(string)
   description = "Map of logical subnet name to CIDR."
 
-  # Valid CIDR formatting
+  # Phase 1 -Valid CIDR formatting
   validation {
     condition     = alltrue([for cidr in values(var.subnet_cidrs) : can(cidrnetmask(trimspace(cidr)))])
     error_message = "All subnet_cidrs values must be valid CIDR blocks."
   }
 
-  # Azure subnet minimum size: /29 or larger (e.g. /29, /28, /27 ... /24).
-  # Prefix length must be <= 29.
+  # Phase 2 
+  # Azure subnet minimum size: /29 or larger (e.g. /29, /28, /27 ... /24). Prefix length must be <= 29.
   validation {
     condition = alltrue([
       for cidr in values(var.subnet_cidrs) :
@@ -125,6 +127,7 @@ variable "subnet_cidrs" {
     error_message = "Azure subnets must be /29 or larger (e.g. /29, /28, /27 ... /24)."
   }
 
+  # Phase 2
   # Subnet must be smaller than the VNet (prefix length greater than VNet prefix length)
   validation {
     condition = alltrue([

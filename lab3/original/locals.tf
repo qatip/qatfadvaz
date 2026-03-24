@@ -1,5 +1,3 @@
-# Lab 3
-
 locals {
   env_canon = join("-",regexall("[a-z0-9]+",lower(trimspace(var.env))))
   project_canon = join("-",regexall("[a-z0-9]+",lower(trimspace(var.project_name))))

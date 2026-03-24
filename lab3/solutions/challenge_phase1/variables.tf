@@ -1,4 +1,3 @@
-#Lab 3
 variable "location" {
   type        = string
   description = "Azure region to deploy into."
@@ -31,13 +30,13 @@ variable "allow_groups" {
 variable "nsg_rules" {
   description = "Map of NSG rules to create."
   type = map(object({
-    priority         = number
-    direction        = string
-    access           = string
-    protocol         = string
+    priority          = number
+    direction         = string
+    access            = string
+    protocol          = string
     destination_ports = list(string)
-    source_cidrs     = list(string)
-    allow_groups     = optional(list(string), [])
+    source_cidrs      = list(string)
+    allow_groups      = optional(list(string), [])
   }))
 
   validation {
@@ -55,7 +54,7 @@ variable "nsg_rules" {
     ])
     error_message = "All NSG rules must have a priority between 100 and 4096."
   }
-  
+
   validation {
     condition = alltrue([
       for _, rule in var.nsg_rules : alltrue([
@@ -86,28 +85,30 @@ variable "nsg_rules" {
     ])
     error_message = "NSG rule priorities must be unique per direction (e.g., unique within Inbound and within Outbound)."
   }
-
 }
-
-################## Nothing above here needs changing ##########################
-
 
 variable "vnet_address_space" {
   type        = string
   description = "CIDR for the Virtual Network address space."
+
+  validation {
+    condition     = can(cidrnetmask(trimspace(var.vnet_address_space)))
+    error_message = "vnet_address_space must be a valid CIDR block (e.g. 10.0.0.0/16)."
+  }
 }
 
 variable "subnet_cidrs" {
   type        = map(string)
   description = "Map of logical subnet name to CIDR."
+
+  # Valid CIDR formatting
+  validation {
+    condition     = alltrue([for cidr in values(var.subnet_cidrs) : can(cidrnetmask(trimspace(cidr)))])
+    error_message = "All subnet_cidrs values must be valid CIDR blocks."
+  }
 }
 
-
-# ----------------------------------------------------------------------------
-# Phase 2 
-# As an extra part of the challenge, consider whether restricting VNet address
-# space to an approved list would help prevent Azure deployment errors.
-# ----------------------------------------------------------------------------
+###
 /*
  variable "approved_vnet_cidrs" {
    type        = set(string)

@@ -99,13 +99,6 @@ variable "subnet_cidrs" {
   description = "Map of logical subnet name to CIDR."
 }
 
-
-# -------------------------------------------------------------------
-# CHALLENGE - Leave commented out until instructed 
-#
-# As part of the challenge, consider whether restricting VNet address
-# space to an approved list would help prevent Azure deployment errors.
-# -------------------------------------------------------------------
 /*
  variable "approved_vnet_cidrs" {
    type        = set(string)
