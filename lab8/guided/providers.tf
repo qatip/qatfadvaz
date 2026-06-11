@@ -13,7 +13,6 @@ terraform {
     container_name       = "tfstate"
     key                  = "bus-unit-state.tfstate"
   }
-
 }
 
 provider "azurerm" {
